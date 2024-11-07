@@ -1,3 +1,4 @@
+use crate::ValidatorInfo;
 use anyhow::Context;
 use log::warn;
 use reqwest::Client;
@@ -7,12 +8,14 @@ use std::collections::HashMap;
 use tokio::task::JoinSet;
 use tracing::info;
 
-pub const BATCH_SIZE: u32 = 256;
+pub const BATCH_SIZE: u32 = 100;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IpData {
+pub struct ValidatorIpData {
     pub pubkey: Option<String>,
+    pub stake: Option<u64>,
+    pub total_slots: Option<u64>,
     pub ip_address: Option<String>,
     pub continent_code: Option<String>,
     pub continent_name: Option<String>,
@@ -58,12 +61,9 @@ impl IpInfo {
 
     pub async fn get_validators_info(
         &self,
-        validators: &[RpcContactInfo],
-    ) -> anyhow::Result<Vec<IpData>> {
-        let contact_info_map: HashMap<String, RpcContactInfo> = validators
-            .iter()
-            .filter_map(|v| v.tpu.map(|tpu| (tpu.ip().to_string(), v.clone())))
-            .collect();
+        validators: &[ValidatorInfo],
+    ) -> anyhow::Result<Vec<ValidatorIpData>> {
+        info!("Getting IP info for {} validators", validators.len());
 
         let mut progress_bar = progress::Bar::new();
         progress_bar.set_job_title("Getting IP info");
@@ -73,16 +73,11 @@ impl IpInfo {
         let mut result = Vec::new();
         let mut join_set = JoinSet::new();
 
-        // let mut join_set = JoinSet::new();
         for batch in validators.chunks(BATCH_SIZE as usize) {
-            let ips = batch
-                .iter()
-                .filter_map(|v| v.tpu.map(|tpu| tpu.ip().to_string()))
-                .collect::<Vec<_>>();
             join_set.spawn(Self::get_ip_info_batch(
                 self.client.clone(),
                 self.api_key.clone(),
-                ips,
+                batch.to_vec(),
             ));
         }
 
@@ -90,18 +85,7 @@ impl IpInfo {
             let ip_data = res??;
             //show progress
             progress_bar.add_percent(percent_per_batch);
-            for mut data in ip_data {
-                let Some(ip) = data.ip_address.clone() else {
-                    warn!("No IP address found for data: {:?}", data);
-                    continue;
-                };
-                let Some(contact_info) = contact_info_map.get(&ip) else {
-                    warn!("No contact info found for IP: {:?}", ip);
-                    continue;
-                };
-                data.pubkey = Some(contact_info.pubkey.to_string());
-                result.push(data);
-            }
+            result.extend_from_slice(ip_data.as_slice())
         }
         progress_bar.jobs_done();
         Ok(result)
@@ -110,9 +94,13 @@ impl IpInfo {
     async fn get_ip_info_batch(
         client: Client,
         api_key: String,
-        ips: Vec<String>,
-    ) -> anyhow::Result<Vec<IpData>> {
-        let comma_separated_ips = ips.join(",");
+        validators: Vec<ValidatorInfo>,
+    ) -> anyhow::Result<Vec<ValidatorIpData>> {
+        let comma_separated_ips = validators
+            .iter()
+            .filter_map(|i| i.ip.clone())
+            .collect::<Vec<_>>()
+            .join(",");
         let url = format!(
             "http://api.db-ip.com/v2/{:}/{:}",
             api_key, comma_separated_ips
@@ -121,14 +109,24 @@ impl IpInfo {
         let status = resp.status();
         let text = resp.text().await.context("cannot decode text")?;
         if status.is_success() {
-            let data: HashMap<String, IpData> = serde_json::from_str(&text)?;
-            Ok(data
-                .into_iter()
-                .map(|(ip, mut v)| {
-                    v.ip_address = Some(ip);
-                    v
-                })
-                .collect())
+            let mut ip_data_map: HashMap<String, ValidatorIpData> = serde_json::from_str(&text)?;
+            let mut result = Vec::new();
+            for validator in validators {
+                let Some(ref ip) = validator.ip else {
+                    warn!("cannot find ip for validator {:?}", validator.ip);
+                    continue;
+                };
+                let Some(mut ip_data) = ip_data_map.get(ip).cloned() else {
+                    warn!("cannot find ip_data for validator {:?}", validator.ip);
+                    continue;
+                };
+                ip_data.ip_address = validator.ip;
+                ip_data.pubkey = Some(validator.contact.pubkey.to_string());
+                ip_data.stake = validator.stake;
+                ip_data.total_slots = validator.total_slots;
+                result.push(ip_data)
+            }
+            Ok(result)
         } else {
             anyhow::bail!("Failed to get IP info: {:?}", text);
         }

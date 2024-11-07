@@ -1,8 +1,8 @@
-use serde::{Serialize};
+use serde::Serialize;
 
-use crate::ip_info::IpData;
+use crate::ip_info::ValidatorIpData;
 
-pub fn save_to_file(data: Vec<IpData>, file_name: &str) -> anyhow::Result<()> {
+pub fn save_to_file(data: Vec<ValidatorIpData>, file_name: &str) -> anyhow::Result<()> {
     let file = std::fs::File::create(file_name)?;
     let mut writer = csv::Writer::from_writer(file);
     for v in data {
